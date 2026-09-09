@@ -38,7 +38,6 @@ from torch.testing._internal.common_utils import (
     skipIfXpu,
 )
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_XPU_AND_TRITON
-from torch.testing._internal.triton_utils import requires_gpu_and_triton
 from torch.utils._triton import has_triton, has_triton_tma_device
 
 
