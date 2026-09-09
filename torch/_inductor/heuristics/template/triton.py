@@ -23,6 +23,7 @@ from ...kernel.bmm import (
     BLACKWELL_BMM_MAX_AUTOTUNE_CONFIGS,
     blackwell_ws_persistent_tma_bmm_template,
     bmm_template,
+    is_blackwell_bmm_2cta_compatible,
 )
 from ...kernel.mm import (
     blackwell_ws_persistent_device_tma_mm_template,
@@ -3119,6 +3120,8 @@ class CUDAMMTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
 class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
     """Bounded configs for the Blackwell persistent-TMA BMM template."""
 
+    bmm_configs = BLACKWELL_BMM_MAX_AUTOTUNE_CONFIGS
+
     def _get_template_configs_impl(
         self,
         kernel_inputs: KernelInputs,
@@ -3137,7 +3140,7 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
         if not can_use_tma(mat1, mat2):
             return
 
-        batch, _, k = map(int, mat1.get_size())
+        batch, m, k = map(int, mat1.get_size())
         batch_b, k_b, _ = map(int, mat2.get_size())
         if batch != batch_b or k != k_b:
             raise NotImplementedError(
@@ -3155,15 +3158,31 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
                 "Blackwell BMM requires one contiguous matrix dimension"
             )
 
+        output_layout = kernel_inputs.output_layout()
+        flatten_output = len(output_layout.size) == 2
+        tma_store = (
+            flatten_output
+            and config.triton.enable_template_tma_store
+            and can_use_tma(output_layout=output_layout)
+        )
         tma_options = {
             "NUM_SMS": get_num_sms(),
             "A_ROW_MAJOR": a_row_major,
             "B_ROW_MAJOR": b_row_major,
-            "tma_store": False,
+            "FLATTEN_OUTPUT": flatten_output,
+            "tma_store": tma_store,
         }
         use_meta_ws = meta_ws_enabled()
-        for candidate in BLACKWELL_BMM_MAX_AUTOTUNE_CONFIGS:
-            yield {
+        for candidate in self.bmm_configs:
+            two_ctas = use_meta_ws and candidate.two_ctas
+            if two_ctas and not is_blackwell_bmm_2cta_compatible(
+                output_batch_rows=m,
+                block_m=candidate.block_m,
+                flatten_output=flatten_output,
+                tma_store=tma_store,
+            ):
+                continue
+            template_kwargs = {
                 "BLOCK_M": candidate.block_m,
                 "BLOCK_N": candidate.block_n,
                 "BLOCK_K": candidate.block_k,
@@ -3176,8 +3195,12 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
                 "FLATTEN": not use_meta_ws,
                 "DATA_PARTITION_FACTOR": candidate.data_partition_factor,
                 "SEPARATE_EPILOGUE_STORE": candidate.separate_epilogue_store,
+                "TWO_CTAS": two_ctas,
                 **tma_options,
             }
+            if two_ctas:
+                template_kwargs["ctas_per_cga"] = (2, 1, 1)
+            yield template_kwargs
 
     def get_extra_kwargs(
         self,
