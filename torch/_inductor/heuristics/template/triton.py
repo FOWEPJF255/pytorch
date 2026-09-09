@@ -3141,7 +3141,7 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
             return
 
         batch, m, k = map(int, mat1.get_size())
-        batch_b, k_b, _ = map(int, mat2.get_size())
+        batch_b, k_b, n = map(int, mat2.get_size())
         if batch != batch_b or k != k_b:
             raise NotImplementedError(
                 "Blackwell BMM does not broadcast logical batches"
@@ -3165,7 +3165,19 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
             and config.triton.enable_template_tma_store
             and can_use_tma(output_layout=output_layout)
         )
-        tma_options = {
+        descriptor_options = {
+            "BATCH_SIZE": batch,
+            "LOGICAL_M": m,
+            "LOGICAL_N": n,
+            "DESCRIPTOR_K": k,
+            "A_BATCH_STRIDE": int(mat1.get_stride()[0]),
+            "B_BATCH_STRIDE": int(mat2.get_stride()[0]),
+            "K_BATCH_OFFSET": 0,
+            "A_M_STRIDE": int(mat1.get_stride()[1]),
+            "A_K_STRIDE": int(mat1.get_stride()[2]),
+            "B_K_STRIDE": int(mat2.get_stride()[1]),
+            "B_N_STRIDE": int(mat2.get_stride()[2]),
+            "OUTPUT_BATCH_ROWS": m,
             "NUM_SMS": get_num_sms(),
             "A_ROW_MAJOR": a_row_major,
             "B_ROW_MAJOR": b_row_major,
@@ -3186,6 +3198,7 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
                 "BLOCK_M": candidate.block_m,
                 "BLOCK_N": candidate.block_n,
                 "BLOCK_K": candidate.block_k,
+                "K_TILES": math.ceil(k / candidate.block_k),
                 "GROUP_M": 8,
                 "num_stages": candidate.num_stages,
                 "num_warps": candidate.num_warps,
@@ -3196,7 +3209,7 @@ class CUDABlackwellBMMTemplateConfigHeuristic(TemplateConfigHeuristics):
                 "DATA_PARTITION_FACTOR": candidate.data_partition_factor,
                 "SEPARATE_EPILOGUE_STORE": candidate.separate_epilogue_store,
                 "TWO_CTAS": two_ctas,
-                **tma_options,
+                **descriptor_options,
             }
             if two_ctas:
                 template_kwargs["ctas_per_cga"] = (2, 1, 1)
