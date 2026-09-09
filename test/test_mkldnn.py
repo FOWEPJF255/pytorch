@@ -1324,6 +1324,68 @@ class TestMkldnn(TestCase):
             self._test_serialization(mkldnn_linear, (x.to_mkldnn(),))
             self._test_tracing(mkldnn_linear, (x.to_mkldnn(),))
 
+    def _linear_reference(self, x, weight, bias):
+        output_shape = (*x.shape[:-1], weight.shape[0])
+        expected = torch.empty(output_shape, dtype=torch.float64)
+        for output_index in itertools.product(
+            *(range(size) for size in output_shape)
+        ):
+            input_index = output_index[:-1]
+            out_feature = output_index[-1]
+            value = 0.0 if bias is None else float(bias[out_feature])
+            for in_feature in range(x.shape[-1]):
+                value += float(x[input_index + (in_feature,)]) * float(
+                    weight[out_feature, in_feature]
+                )
+            expected[output_index] = value
+        return expected.to(dtype=torch.float32)
+
+    @parametrize("input_shape", [(1, 256, 10), (2, 3, 10), (2, 3, 4, 10)])
+    @parametrize("with_bias", [True, False])
+    def test_mkldnn_linear_higher_rank(self, input_shape, with_bias):
+        in_features = input_shape[-1]
+        out_features = 7
+        x = torch.randn(input_shape, dtype=torch.float32)
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        bias = torch.randn(out_features, dtype=torch.float32) if with_bias else None
+
+        expected = self._linear_reference(x, weight, bias)
+
+        actual = torch._C._nn.mkldnn_linear(
+            x.to_mkldnn(),
+            weight.to_mkldnn(),
+            bias.to_mkldnn() if bias is not None else None,
+        ).to_dense()
+
+        self.assertEqual(
+            actual,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    @parametrize("input_shape", [(1, 256, 10), (2, 3, 10), (2, 3, 4, 10)])
+    def test_mkldnn_linear_higher_rank_packed_weight(self, input_shape):
+        x = torch.randn(input_shape, dtype=torch.float32)
+        weight = torch.randn(7, 10, dtype=torch.float32)
+        bias = torch.randn(7, dtype=torch.float32)
+        flattened_m = x.numel() // x.size(-1)
+        packed_weight = torch.ops.mkldnn._reorder_linear_weight(
+            weight, flattened_m
+        )
+
+        expected = self._linear_reference(x, weight, bias)
+        actual = torch._C._nn.mkldnn_linear(
+            x.to_mkldnn(), packed_weight, bias.to_mkldnn()
+        ).to_dense()
+
+        self.assertEqual(
+            actual,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
     def test_linear_backward(self):
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
