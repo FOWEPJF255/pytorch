@@ -55,7 +55,9 @@ def _on_graph_node_created(_domain: int, _cbid: int, cbdata: int) -> None:
         _get_annotatable_type_values,
         capture_root_graph_id,
         current_annotation,
+        node_type_has_source_id,
         note_body_graph_id,
+        note_sourceless_node,
         record_node_annotation,
         source_keyed,
     )
@@ -90,6 +92,11 @@ def _on_graph_node_created(_domain: int, _cbid: int, cbdata: int) -> None:
             return
         # Neither the capture nor the exec graph's id, so the destroy purge needs telling.
         note_body_graph_id(body_graph_id)
+    # The node type is only in hand here, and the registry needs it to know which entries
+    # a source-keyed capture must still alias into exec space (see
+    # _graph_annotations.note_sourceless_node).
+    if not node_type_has_source_id(graph_data.node_type):
+        note_sourceless_node(tools_id)
     record_node_annotation(tools_id, annotation)
 
 
