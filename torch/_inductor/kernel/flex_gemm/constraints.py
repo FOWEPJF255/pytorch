@@ -213,7 +213,7 @@ def is_flex_gemm_partial_reduction_shape(
 
 
 def local_reduce_unsupported_tensorssa_error(
-    reduction: Any, *, value_only: bool = False
+    reduction: str, *, value_only: bool = False
 ) -> NotImplementedError:
     """Explain why a grouped reduction is outside the current TensorSSA subset."""
     suffix = " value-only reduction" if value_only else ""

@@ -62,28 +62,28 @@ class GroupedTensorSSALayout(GemmReductionGeometry):
     def tensorssa_axis(self) -> int:
         return 1 - self.axis if self.swapped else self.axis
 
-    def fragment_group_size_expr(self, source: Any) -> str:
+    def fragment_group_size_expr(self, source: object) -> str:
         """Return the local group size available in this epilogue fragment."""
         return (
             f"cutlass.const_expr(min({self.group_size}, "
             f"cute.size({source}.shape, mode=[0])))"
         )
 
-    def fragment_repeat_expr(self, source: Any) -> str:
+    def fragment_repeat_expr(self, source: object) -> str:
         """Return the repeat count needed to cover the current epilogue fragment."""
         return (
             f"cutlass.const_expr(cute.size({source}.shape, mode=[0]) "
             f"// min({self.group_size}, cute.size({source}.shape, mode=[0])))"
         )
 
-    def tensorssa_shape(self, source: Any) -> str:
+    def tensorssa_shape(self, source: object) -> str:
         fragment_group_size = self.fragment_group_size_expr(source)
         repeats = self.fragment_repeat_expr(source)
         if self.tensorssa_axis == 1:
             return f"((1, {fragment_group_size}, {repeats}), 1, 1)"
         return f"(({fragment_group_size}, 1, {repeats}), 1, 1)"
 
-    def keepdim_shape(self, source: Any) -> str:
+    def keepdim_shape(self, source: object) -> str:
         return f"((1, 1, {self.fragment_repeat_expr(source)}), 1, 1)"
 
     @property
