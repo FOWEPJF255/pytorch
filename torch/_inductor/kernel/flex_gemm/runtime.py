@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import inspect
+import logging
 import os
+import threading
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -18,15 +21,93 @@ from torch._inductor.kernel.flex_gemm.constraints import (
 from torch._inductor.kernel.flex_gemm.output_layout import FlexGemmOutputStorageLayout
 from torch._inductor.runtime.cache_dir_utils import cache_dir
 from torch._prims_common import is_expandable_to
+from torch._subclasses.fake_tensor import is_fake
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+log = logging.getLogger(__name__)
+
+
 def inductor_quack_cache_dir() -> str:
     """Return the Inductor-owned QuACK cache root for generated FlexGEMM."""
     return os.path.join(cache_dir(), "quack")
+
+
+_CONFIG_SELECTION: contextvars.ContextVar[list[Any] | None] = contextvars.ContextVar(
+    "flex_gemm_config_selection", default=None
+)
+
+
+@contextlib.contextmanager
+def select_flex_gemm_configs():
+    """Collect QuACK's legal GemmConfigs without launching the generated call."""
+    configs: list[Any] = []
+    token = _CONFIG_SELECTION.set(configs)
+    try:
+        yield configs
+    finally:
+        _CONFIG_SELECTION.reset(token)
+
+
+_PRECOMPILE_LOCK = threading.Lock()
+
+
+def precompile_flex_gemm_kernel(run: Callable[[], None]) -> None:
+    """Compile the QuACK kernel ``run`` needs now instead of at first call.
+
+    ``run`` invokes the generated kernel on real tensors; the cold ``jit_cache``
+    miss compiles in-process. CuTeDSL compilation is serialized because
+    Inductor precompiles choices from several threads.
+    """
+    with _PRECOMPILE_LOCK:
+        run()
+
+
+def flex_gemm_candidate_configs(
+    epimod: Any,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor | None,
+    output_buffers: dict[str, torch.Tensor],
+    operands: dict[str, Any],
+    concat_layout: Any,
+) -> list[Any]:
+    """Return QuACK's legal configs for this call, its untuned default first.
+
+    Mirrors ``EpiMod.__call__``'s selection: the per-arch default leads when it
+    is legal, followed by every other candidate the EpiMod's ops accept.
+    """
+    from torch._vendor.quack.cute_dsl_utils import get_device_capacity
+    from torch._vendor.quack.gemm_config import (
+        blockscaled_default_config,
+        default_config,
+    )
+    from torch._vendor.quack.gemm_runtime.autotune import (
+        _legal_mod_configs,
+        mod_selection_args,
+    )
+
+    device = a.device
+    capacity = get_device_capacity(device)[0]
+    b_kn = capacity >= 9 and not concat_layout
+    named_args = mod_selection_args(
+        operands,
+        {name: output_buffers[name] for name in epimod.outputs},
+        A=a,
+        B=b if b_kn else b.mT,
+        b_kn=b_kn,
+        SFA=sfa,
+        concat_layout=concat_layout,
+    )
+    preferred = (
+        blockscaled_default_config(a.shape[-2], b.shape[-1], device_capacity=capacity)
+        if sfa is not None
+        else default_config(device)
+    )
+    return _legal_mod_configs(epimod, device, named_args, preferred_config=preferred)
 
 
 # NOTE [Byte-backed epilogue tensor storage]
@@ -288,11 +369,14 @@ def gemm_epilogue(
     epilogue_arg_kinds: tuple[str, ...] = (),
     local_reduce: FlexGemmRuntimeLocalReducePlan | None = None,
     output_contraction: FlexGemmOutputContraction | None = None,
-    tuned: bool = False,
-    config_constraints: tuple[tuple[str, Any], ...] = (),
+    config: tuple[tuple[str, Any], ...] | None = None,
     stream: int | None = None,
 ) -> torch.Tensor:
-    """Run a dense FlexGEMM call through the vendored QuACK EpiMod."""
+    """Run a dense FlexGEMM call through the vendored QuACK EpiMod.
+
+    ``config`` pins the exact GemmConfig Inductor selected; ``None`` is only
+    used by the lowering-time legal-config probe, which returns before launch.
+    """
     if (
         output_contraction is not None
         and output_contraction.chunked
@@ -367,6 +451,32 @@ def gemm_epilogue(
             ),
         }
     )
+    main_name = "main" if output_contraction is not None else "D"
+    concat_layout = (
+        None if output_contraction is None else output_contraction.concat_layout
+    )
+    legal_configs = _CONFIG_SELECTION.get()
+    if legal_configs is not None:
+        if not is_fake(a):
+            raise AssertionError("FlexGEMM config probe reached a real GEMM call")
+        legal_configs.extend(
+            flex_gemm_candidate_configs(
+                epimod,
+                a,
+                b,
+                None,
+                output_buffers,
+                operands,
+                concat_layout,
+            )
+        )
+        return output_buffers[main_name]
+    if config is not None:
+        from torch._vendor.quack.gemm_config import GemmConfig
+
+        quack_config = GemmConfig(**dict(config))
+    else:
+        quack_config = None
     stream_context = (
         torch.cuda.stream(torch.cuda.ExternalStream(stream, device=a.device))
         if stream is not None
@@ -383,12 +493,10 @@ def gemm_epilogue(
             out=output_buffers,
             out_dtype=out.dtype,
             store_d=output_contraction is None,
-            config=None,
-            config_constraints=config_constraints,
-            tuned=tuned,
-            concat_layout=(
-                None if output_contraction is None else output_contraction.concat_layout
-            ),
+            config=quack_config,
+            tuned=False,
+            concat_layout=concat_layout,
+            compile_dispatch=False,
             **operands,
         )
-    return result["main" if output_contraction is not None else "D"]
+    return result[main_name]
