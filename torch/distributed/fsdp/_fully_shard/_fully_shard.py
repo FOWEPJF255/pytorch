@@ -419,6 +419,20 @@ class FSDPModule:
         both reduce-scatter and all-reduce together. This is the equivalence of
         `no_sync` in FSDP1.
 
+        After a backward without synchronization, ``model.parameters()`` exposes
+        the accumulated gradients as DTensors with ``Partial("avg")`` placements
+        on the data-parallel mesh dimensions. Their local tensors contain the
+        unsharded gradients in the effective ``MixedPrecisionPolicy.reduce_dtype``.
+        The visible parameter's ``grad_dtype`` temporarily matches this dtype;
+        synchronization restores the sharded gradient dtype specified before
+        :func:`fully_shard`. Clearing these gradients with ``zero_grad()`` clears
+        the accumulation. With a custom gradient divide factor, the placements
+        are ``Partial("sum")`` and the factor is applied during synchronization.
+        Before starting unsynchronized fp16 accumulation, clear any previously
+        reduced gradients with ``zero_grad(set_to_none=True)``.
+        This is also required for ``spmd_types`` gradients whose non-DP
+        placements differ from the parameter's placements.
+
         Args:
             requires_gradient_sync (bool): Whether to reduce gradients for the
                 module's parameters.
@@ -433,6 +447,7 @@ class FSDPModule:
                 for fsdp_param_group in state._fsdp_param_groups:
                     fsdp_param_group.reduce_grads = requires_gradient_sync
                     fsdp_param_group.all_reduce_grads = requires_gradient_sync
+                    fsdp_param_group._set_unsharded_grad_dtype()
 
     def set_requires_all_reduce(
         self, requires_all_reduce: bool, *, recurse: bool = True
@@ -449,6 +464,7 @@ class FSDPModule:
                 state = module._get_fsdp_state()
                 for fsdp_param_group in state._fsdp_param_groups:
                     fsdp_param_group.all_reduce_grads = requires_all_reduce
+                    fsdp_param_group._set_unsharded_grad_dtype()
 
     def set_reshard_after_forward(
         self, reshard_after_forward: bool, recurse: bool = True
